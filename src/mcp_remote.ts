@@ -23,15 +23,14 @@ type IndexFile = {
 };
 
 const INDEX_FILE = path.resolve("artifacts/index.json");
-
-// Render は PORT を環境変数で渡す（ローカルは 8787 などでOK）
 const PORT = Number(process.env.PORT || 8787);
 
-// GitHub の “引用URL” を組み立てるためのベース（あなたのURLに差し替えてOK）
+// GitHub “引用URL” のベース（末尾 / 必須）
 const DOC_BASE_URL =
   process.env.DOC_BASE_URL ||
-  "https://github.com/<OWNER>/rag-mcp-poc/blob/main/";
+  "https://github.com/Kou0402/rag-mcp-poc/blob/develop/";
 
+// OpenAI
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 function dot(a: number[], b: number[]) {
@@ -50,7 +49,6 @@ function cosineSim(a: number[], b: number[]) {
 }
 
 function sourceWeight(source: string): number {
-  // 「一次情報を上げる」の例（必要なら調整）
   if (source === "docs/api.md") return 1.15;
   if (source === "docs/architecture.md") return 1.1;
   if (source === "docs/overview.md") return 1.05;
@@ -67,111 +65,221 @@ async function embedQuery(q: string, model: string): Promise<number[]> {
 }
 
 function canonicalUrlFor(meta: ChunkMeta): string {
-  // “チャンク”単位の厳密なアンカーは作りにくいので、まずはファイルURLでOK（引用用）
   return `${DOC_BASE_URL}${meta.source}`;
 }
 
+/**
+ * ChatGPT 側が渡してくる入力形式が揺れるのに備え、
+ * string / {query} / {input} / {q} / {input:{query}} / {input:{q}} を全部受けて最終的に string に正規化する
+ */
+const SearchInput = z
+  .union([
+    z.string().min(1),
+    z.object({
+      query: z.string().min(1),
+      topK: z.number().int().min(1).max(20).optional(),
+    }),
+    z.object({
+      q: z.string().min(1),
+      topK: z.number().int().min(1).max(20).optional(),
+    }),
+    z.object({ input: z.string().min(1) }),
+    z.object({ input: z.object({ query: z.string().min(1) }) }),
+    z.object({ input: z.object({ q: z.string().min(1) }) }),
+  ])
+  .transform((v) => {
+    if (typeof v === "string") return { query: v, topK: 8 };
+    if ("query" in v) return { query: v.query, topK: v.topK ?? 8 };
+    if ("q" in v) return { query: v.q, topK: v.topK ?? 8 };
+    if ("input" in v) {
+      const inp: any = (v as any).input;
+      if (typeof inp === "string") return { query: inp, topK: 8 };
+      if (inp && typeof inp === "object") {
+        if (typeof inp.query === "string") return { query: inp.query, topK: 8 };
+        if (typeof inp.q === "string") return { query: inp.q, topK: 8 };
+      }
+    }
+    // ここには来ない想定（念のため）
+    return { query: String(v), topK: 8 };
+  });
+
+const FetchInput = z
+  .union([
+    z.string().min(1),
+    z.object({ id: z.string().min(1) }),
+    z.object({ input: z.string().min(1) }),
+    z.object({ input: z.object({ id: z.string().min(1) }) }),
+  ])
+  .transform((v) => {
+    if (typeof v === "string") return v;
+    if ("id" in v) return v.id;
+    if ("input" in v) {
+      const inp: any = (v as any).input;
+      if (typeof inp === "string") return inp;
+      if (inp && typeof inp === "object" && typeof inp.id === "string")
+        return inp.id;
+    }
+    return String(v);
+  });
+
 async function main() {
+  // index 読み込み
   const raw = await fs.readFile(INDEX_FILE, "utf-8");
   const index = JSON.parse(raw) as IndexFile;
 
   // MCP Server
   const server = new McpServer({ name: "rag-mcp-poc", version: "1.0.0" });
 
-  /**
-   * ChatGPT Connectors / deep research 互換：
-   * 必須ツール名が search / fetch で、返り値は content[0].type="text" に JSON 文字列を入れる :contentReference[oaicite:3]{index=3}
-   */
+  // search（ChatGPT 互換: tool名 search / 結果は content[0].type="text" に JSON文字列）
   server.tool(
     "search",
     "Search knowledge base (Markdown docs) and return result list for citation.",
-    z.string().min(1),
-    async (query) => {
-      const k = 8; // 固定（ChatGPT互換のため）
-      const qEmb = await embedQuery(query, index.model);
+    SearchInput,
+    async ({ query, topK }) => {
+      try {
+        const k = topK ?? 8;
 
-      const scored = index.chunks
-        .map((c) => {
-          const score = cosineSim(qEmb, c.embedding);
-          const weighted = score * sourceWeight(c.meta.source);
-          return { chunk: c, score, weighted };
-        })
-        .sort((a, b) => b.weighted - a.weighted)
-        .slice(0, k);
+        // 念のため trim
+        const q = query.trim();
+        if (!q) {
+          return {
+            isError: true,
+            content: [
+              { type: "text", text: JSON.stringify({ error: "empty_query" }) },
+            ],
+          };
+        }
 
-      const results = scored.map(({ chunk }) => ({
-        id: chunk.id,
-        title: `${chunk.meta.heading} (${chunk.meta.source})`,
-        url: canonicalUrlFor(chunk.meta),
-      }));
+        const qEmb = await embedQuery(q, index.model);
 
-      return {
-        content: [{ type: "text", text: JSON.stringify({ results }) }],
-      };
-    }
-  );
+        const scored = index.chunks
+          .map((c) => {
+            const score = cosineSim(qEmb, c.embedding);
+            const weighted = score * sourceWeight(c.meta.source);
+            return { chunk: c, score, weighted };
+          })
+          .sort((a, b) => b.weighted - a.weighted)
+          .slice(0, k);
 
-  server.tool(
-    "fetch",
-    "Fetch full text of a search result item by id.",
-    z.string().min(1),
-    async (id) => {
-      const hit = index.chunks.find((c) => c.id === id);
-      if (!hit) {
+        const results = scored.map(({ chunk }) => ({
+          id: chunk.id,
+          title: `${chunk.meta.heading} (${chunk.meta.source})`,
+          url: canonicalUrlFor(chunk.meta),
+        }));
+
         return {
+          content: [{ type: "text", text: JSON.stringify({ results }) }],
+        };
+      } catch (e: any) {
+        console.error("[TOOL_ERR][search]", e);
+        return {
+          isError: true,
           content: [
             {
               type: "text",
               text: JSON.stringify({
-                id,
-                title: "NOT_FOUND",
-                text: "",
-                url: DOC_BASE_URL,
-                metadata: { error: "not_found" },
+                error: "search_failed",
+                message: e?.message ?? String(e),
               }),
             },
           ],
         };
       }
+    }
+  );
 
-      const doc = {
-        id: hit.id,
-        title: `${hit.meta.heading} (${hit.meta.source})`,
-        text: hit.text,
-        url: canonicalUrlFor(hit.meta),
-        metadata: hit.meta,
-      };
+  // fetch（ChatGPT 互換: tool名 fetch）
+  server.tool(
+    "fetch",
+    "Fetch full text of a search result item by id.",
+    FetchInput,
+    async (id) => {
+      try {
+        const hit = index.chunks.find((c) => c.id === id);
+        if (!hit) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  id,
+                  title: "NOT_FOUND",
+                  text: "",
+                  url: DOC_BASE_URL,
+                  metadata: { error: "not_found" },
+                }),
+              },
+            ],
+          };
+        }
 
-      return {
-        content: [{ type: "text", text: JSON.stringify(doc) }],
-      };
+        const doc = {
+          id: hit.id,
+          title: `${hit.meta.heading} (${hit.meta.source})`,
+          text: hit.text,
+          url: canonicalUrlFor(hit.meta),
+          metadata: hit.meta,
+        };
+
+        return { content: [{ type: "text", text: JSON.stringify(doc) }] };
+      } catch (e: any) {
+        console.error("[TOOL_ERR][fetch]", e);
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                error: "fetch_failed",
+                message: e?.message ?? String(e),
+              }),
+            },
+          ],
+        };
+      }
     }
   );
 
   // Streamable HTTP Transport（ステートレス）
   const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined, // ステートレス :contentReference[oaicite:5]{index=5}
+    sessionIdGenerator: undefined,
   });
 
   await server.connect(transport);
 
   // HTTP server
   const app = express();
-  app.use((req, _res, next) => {
+  app.disable("x-powered-by");
+
+  // JSON body
+  app.use(express.json({ limit: "2mb" }));
+
+  // Request logging（JSON-RPC method / tool名 / status まで出す）
+  app.use((req, res, next) => {
     console.error(`[REQ] ${req.method} ${req.url}`);
     console.error(
-      `[HDR] content-type=${req.headers["content-type"]} len=${req.headers["content-length"]}`
+      `[HDR] ct=${req.headers["content-type"]} len=${req.headers["content-length"]}`
     );
+
+    const body: any = (req as any).body;
+    if (body && typeof body === "object") {
+      console.error(`[RPC] method=${body.method} id=${body.id ?? "null"}`);
+      const toolName = body?.params?.name;
+      if (toolName) console.error(`[RPC] tool=${toolName}`);
+    }
+
+    res.on("finish", () => {
+      console.error(`[RES] ${req.method} ${req.url} -> ${res.statusCode}`);
+    });
     next();
   });
 
-  app.use(express.json({ limit: "2mb" }));
-
   app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
+  // MCP endpoint
   app.all("/mcp", async (req, res) => {
     try {
-      // POST のときは JSON ボディがある / GET のときは無い
       await transport.handleRequest(req, res, (req as any).body);
     } catch (e) {
       console.error("[MCP_ERR]", e);
