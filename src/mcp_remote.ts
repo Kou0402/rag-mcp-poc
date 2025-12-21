@@ -85,14 +85,9 @@ async function main() {
   server.tool(
     "search",
     "Search knowledge base (Markdown docs) and return result list for citation.",
-    {
-      // OpenAI の説明は「単一の query string」だが、MCP 的には JSON で受けるので {query} にしておく :contentReference[oaicite:4]{index=4}
-      query: z.string().min(1),
-      topK: z.number().int().min(1).max(20).optional(),
-    },
-    async ({ query, topK }) => {
-      const k = topK ?? 8;
-
+    z.string().min(1),
+    async (query) => {
+      const k = 8; // 固定（ChatGPT互換のため）
       const qEmb = await embedQuery(query, index.model);
 
       const scored = index.chunks
@@ -105,18 +100,13 @@ async function main() {
         .slice(0, k);
 
       const results = scored.map(({ chunk }) => ({
-        id: chunk.id, // fetch で再利用するユニークID
+        id: chunk.id,
         title: `${chunk.meta.heading} (${chunk.meta.source})`,
         url: canonicalUrlFor(chunk.meta),
       }));
 
       return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ results }),
-          },
-        ],
+        content: [{ type: "text", text: JSON.stringify({ results }) }],
       };
     }
   );
@@ -124,13 +114,10 @@ async function main() {
   server.tool(
     "fetch",
     "Fetch full text of a search result item by id.",
-    {
-      id: z.string().min(1),
-    },
-    async ({ id }) => {
+    z.string().min(1),
+    async (id) => {
       const hit = index.chunks.find((c) => c.id === id);
       if (!hit) {
-        // fetch の仕様は「1つのオブジェクト」なので、not found は text にエラーを入れて返す
         return {
           content: [
             {
