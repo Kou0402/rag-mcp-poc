@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "ragDocs": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "tsx", "${workspaceFolder}/scripts/mcp_rag.ts"],
+      "envFile": "${workspaceFolder}/.env"
+    }
+  }
+}

@@ -1,0 +1,44 @@
+# ===== Node / TypeScript =====
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tsbuildinfo
+
+# ===== dotenv / secrets =====
+.env
+.env.*
+!.env.example
+
+# ===== Build outputs =====
+dist/
+build/
+out/
+coverage/
+.nyc_output/
+
+# ===== Runtime / temp =====
+tmp/
+temp/
+*.tmp
+*.log
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ===== IDE =====
+.idea/
+*.swp
+
+# ===== MCP / RAG artifacts =====
+# index.json は Remote MCP(Render) で使うならコミットする想定（除外しない）
+artifacts/*.md
+artifacts/*.txt
+artifacts/*.log
+
+# ===== Misc =====
+*.bak
+*.orig
