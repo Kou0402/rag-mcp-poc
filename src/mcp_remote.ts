@@ -157,15 +157,24 @@ async function main() {
 
   // HTTP server
   const app = express();
+  app.use((req, _res, next) => {
+    console.error(`[REQ] ${req.method} ${req.url}`);
+    console.error(
+      `[HDR] content-type=${req.headers["content-type"]} len=${req.headers["content-length"]}`
+    );
+    next();
+  });
+
   app.use(express.json({ limit: "2mb" }));
 
   app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
-  // MCP endpoint
-  app.post("/mcp", async (req, res) => {
+  app.all("/mcp", async (req, res) => {
     try {
-      await transport.handleRequest(req, res, req.body);
+      // POST のときは JSON ボディがある / GET のときは無い
+      await transport.handleRequest(req, res, (req as any).body);
     } catch (e) {
+      console.error("[MCP_ERR]", e);
       if (!res.headersSent) {
         res.status(500).json({
           jsonrpc: "2.0",
@@ -174,24 +183,6 @@ async function main() {
         });
       }
     }
-  });
-
-  // GET /mcp は SSE をやらないなら 405 でOK :contentReference[oaicite:6]{index=6}
-  app.get("/mcp", (_req, res) => {
-    res.status(405).json({
-      jsonrpc: "2.0",
-      error: { code: -32000, message: "Method not allowed." },
-      id: null,
-    });
-  });
-
-  // ステートフルでなければ DELETE も 405 でOK :contentReference[oaicite:7]{index=7}
-  app.delete("/mcp", (_req, res) => {
-    res.status(405).json({
-      jsonrpc: "2.0",
-      error: { code: -32000, message: "Method not allowed." },
-      id: null,
-    });
   });
 
   app.listen(PORT, "0.0.0.0", () => {
