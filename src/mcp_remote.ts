@@ -25,12 +25,11 @@ type IndexFile = {
 const INDEX_FILE = path.resolve("artifacts/index.json");
 const PORT = Number(process.env.PORT || 8787);
 
-// GitHub “引用URL” のベース（末尾 / 必須）
+// 末尾 / 必須
 const DOC_BASE_URL =
   process.env.DOC_BASE_URL ||
   "https://github.com/Kou0402/rag-mcp-poc/blob/develop/";
 
-// OpenAI
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 function dot(a: number[], b: number[]) {
@@ -69,83 +68,100 @@ function canonicalUrlFor(meta: ChunkMeta): string {
 }
 
 /**
- * ChatGPT 側が渡してくる入力形式が揺れるのに備え、
- * string / {query} / {input} / {q} / {input:{query}} / {input:{q}} を全部受けて最終的に string に正規化する
+ * ChatGPT/Connectors 側は tools/call の arguments が「文字列」になったり
+ * { query } / { input } / { arguments } といった形で来ることがある。
+ * ここで必ず { query, topK } に正規化する。
  */
-const SearchInput = z
-  .union([
-    z.string().min(1),
-    z.object({
-      query: z.string().min(1),
-      topK: z.number().int().min(1).max(20).optional(),
-    }),
-    z.object({
-      q: z.string().min(1),
-      topK: z.number().int().min(1).max(20).optional(),
-    }),
-    z.object({ input: z.string().min(1) }),
-    z.object({ input: z.object({ query: z.string().min(1) }) }),
-    z.object({ input: z.object({ q: z.string().min(1) }) }),
-  ])
-  .transform((v) => {
-    if (typeof v === "string") return { query: v, topK: 8 };
-    if ("query" in v) return { query: v.query, topK: v.topK ?? 8 };
-    if ("q" in v) return { query: v.q, topK: v.topK ?? 8 };
-    if ("input" in v) {
-      const inp: any = (v as any).input;
-      if (typeof inp === "string") return { query: inp, topK: 8 };
-      if (inp && typeof inp === "object") {
-        if (typeof inp.query === "string") return { query: inp.query, topK: 8 };
-        if (typeof inp.q === "string") return { query: inp.q, topK: 8 };
-      }
-    }
-    // ここには来ない想定（念のため）
-    return { query: String(v), topK: 8 };
-  });
+function normalizeSearchArgs(raw: unknown): { query: string; topK: number } {
+  const DEFAULT_TOPK = 8;
 
-const FetchInput = z
-  .union([
-    z.string().min(1),
-    z.object({ id: z.string().min(1) }),
-    z.object({ input: z.string().min(1) }),
-    z.object({ input: z.object({ id: z.string().min(1) }) }),
-  ])
-  .transform((v) => {
-    if (typeof v === "string") return v;
-    if ("id" in v) return v.id;
-    if ("input" in v) {
-      const inp: any = (v as any).input;
-      if (typeof inp === "string") return inp;
-      if (inp && typeof inp === "object" && typeof inp.id === "string")
-        return inp.id;
-    }
-    return String(v);
-  });
+  const unwrap = (v: any): any => {
+    if (!v || typeof v !== "object") return v;
+    // 一部クライアントは { arguments: ... } や { input: ... } を二重に包む
+    if ("arguments" in v) return unwrap((v as any).arguments);
+    if ("input" in v) return unwrap((v as any).input);
+    return v;
+  };
+
+  const v = unwrap(raw);
+
+  if (typeof v === "string") {
+    return { query: v, topK: DEFAULT_TOPK };
+  }
+
+  if (v && typeof v === "object") {
+    const o: any = v;
+    const q =
+      typeof o.query === "string"
+        ? o.query
+        : typeof o.q === "string"
+        ? o.q
+        : undefined;
+
+    const topK =
+      typeof o.topK === "number" && Number.isFinite(o.topK)
+        ? Math.max(1, Math.min(20, Math.trunc(o.topK)))
+        : DEFAULT_TOPK;
+
+    if (typeof q === "string") return { query: q, topK };
+  }
+
+  // どうしても取れない場合は空にして後段でエラー扱い
+  return { query: "", topK: DEFAULT_TOPK };
+}
+
+function normalizeFetchArgs(raw: unknown): string {
+  const unwrap = (v: any): any => {
+    if (!v || typeof v !== "object") return v;
+    if ("arguments" in v) return unwrap((v as any).arguments);
+    if ("input" in v) return unwrap((v as any).input);
+    return v;
+  };
+
+  const v = unwrap(raw);
+
+  if (typeof v === "string") return v;
+
+  if (v && typeof v === "object") {
+    const o: any = v;
+    if (typeof o.id === "string") return o.id;
+  }
+
+  return "";
+}
 
 async function main() {
-  // index 読み込み
   const raw = await fs.readFile(INDEX_FILE, "utf-8");
   const index = JSON.parse(raw) as IndexFile;
 
-  // MCP Server
   const server = new McpServer({ name: "rag-mcp-poc", version: "1.0.0" });
 
-  // search（ChatGPT 互換: tool名 search / 結果は content[0].type="text" に JSON文字列）
+  /**
+   * 重要：
+   * - schema を厳格にしすぎると、クライアント側の引数形の揺れで落ちる
+   * - ここでは z.any() で受け、サーバ側で正規化する（現実運用で強い）
+   */
   server.tool(
     "search",
     "Search knowledge base (Markdown docs) and return result list for citation.",
-    SearchInput,
-    async ({ query, topK }) => {
+    z.any(),
+    async (args) => {
       try {
-        const k = topK ?? 8;
-
-        // 念のため trim
+        const { query, topK } = normalizeSearchArgs(args);
         const q = query.trim();
+
         if (!q) {
           return {
             isError: true,
             content: [
-              { type: "text", text: JSON.stringify({ error: "empty_query" }) },
+              {
+                type: "text",
+                text: JSON.stringify({
+                  error: "invalid_query",
+                  message:
+                    "search arguments did not contain a valid query string",
+                }),
+              },
             ],
           };
         }
@@ -159,7 +175,7 @@ async function main() {
             return { chunk: c, score, weighted };
           })
           .sort((a, b) => b.weighted - a.weighted)
-          .slice(0, k);
+          .slice(0, topK);
 
         const results = scored.map(({ chunk }) => ({
           id: chunk.id,
@@ -188,13 +204,29 @@ async function main() {
     }
   );
 
-  // fetch（ChatGPT 互換: tool名 fetch）
   server.tool(
     "fetch",
     "Fetch full text of a search result item by id.",
-    FetchInput,
-    async (id) => {
+    z.any(),
+    async (args) => {
       try {
+        const id = normalizeFetchArgs(args).trim();
+
+        if (!id) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  error: "invalid_id",
+                  message: "fetch arguments did not contain a valid id string",
+                }),
+              },
+            ],
+          };
+        }
+
         const hit = index.chunks.find((c) => c.id === id);
         if (!hit) {
           return {
@@ -222,7 +254,9 @@ async function main() {
           metadata: hit.meta,
         };
 
-        return { content: [{ type: "text", text: JSON.stringify(doc) }] };
+        return {
+          content: [{ type: "text", text: JSON.stringify(doc) }],
+        };
       } catch (e: any) {
         console.error("[TOOL_ERR][fetch]", e);
         return {
@@ -241,21 +275,17 @@ async function main() {
     }
   );
 
-  // Streamable HTTP Transport（ステートレス）
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
   });
 
   await server.connect(transport);
 
-  // HTTP server
   const app = express();
   app.disable("x-powered-by");
-
-  // JSON body
   app.use(express.json({ limit: "2mb" }));
 
-  // Request logging（JSON-RPC method / tool名 / status まで出す）
+  // JSON-RPC method / tool名 / status を出す
   app.use((req, res, next) => {
     console.error(`[REQ] ${req.method} ${req.url}`);
     console.error(
@@ -267,6 +297,15 @@ async function main() {
       console.error(`[RPC] method=${body.method} id=${body.id ?? "null"}`);
       const toolName = body?.params?.name;
       if (toolName) console.error(`[RPC] tool=${toolName}`);
+
+      // arguments の形を確認したいときだけ（個人情報を含み得るので全部は出さない）
+      const argType = typeof body?.params?.arguments;
+      if (argType) console.error(`[RPC] argsType=${argType}`);
+      if (argType === "object" && body?.params?.arguments) {
+        console.error(
+          `[RPC] argsKeys=${Object.keys(body.params.arguments).join(",")}`
+        );
+      }
     }
 
     res.on("finish", () => {
@@ -277,7 +316,6 @@ async function main() {
 
   app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
-  // MCP endpoint
   app.all("/mcp", async (req, res) => {
     try {
       await transport.handleRequest(req, res, (req as any).body);
